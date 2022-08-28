@@ -2,11 +2,12 @@
 # OpenVQA
 # Written by Yuhao Cui https://github.com/cuiyuhao1996
 # --------------------------------------------------------
-
+import torch
 import numpy as np
 import glob, json, re, en_core_web_lg
 from openvqa.core.base_dataset import BaseDataSet
 from openvqa.utils.ans_punct import prep_ans
+from irl_dcb import utils
 
 class DataSet(BaseDataSet):
     def __init__(self, __C):
@@ -22,7 +23,14 @@ class DataSet(BaseDataSet):
             glob.glob(__C.FEATS_PATH[__C.DATASET]['train'] + '/*.npz') + \
             glob.glob(__C.FEATS_PATH[__C.DATASET]['val'] + '/*.npz') + \
             glob.glob(__C.FEATS_PATH[__C.DATASET]['test'] + '/*.npz')
-
+        lr_frcn_feat_path_list = \
+            glob.glob('./data/vqa/dcb/train2014/LR/' + '/*.pth.tar') + \
+            glob.glob('./data/vqa/dcb/val2014/LR/' + '/*.pth.tar') + \
+            glob.glob('./data/vqa/dcb/test2015/LR/' + '/*.pth.tar')
+        hr_frcn_feat_path_list = \
+            glob.glob('./data/vqa/dcb/train2014/HR/' + '/*.pth.tar') + \
+            glob.glob('./data/vqa/dcb/val2014/HR/' + '/*.pth.tar') + \
+            glob.glob('./data/vqa/dcb/test2015/HR/' + '/*.pth.tar')
         # Loading question word list
         stat_ques_list = \
             json.load(open(__C.RAW_PATH[__C.DATASET]['train'], 'r'))['questions'] + \
@@ -60,6 +68,8 @@ class DataSet(BaseDataSet):
 
         # {image id} -> {image feature absolutely path}
         self.iid_to_frcn_feat_path = self.img_feat_path_load(frcn_feat_path_list)
+        self.lr_iid_to_frcn_feat_path = self.img_feat_path_load(lr_frcn_feat_path_list)
+        self.hr_iid_to_frcn_feat_path = self.img_feat_path_load(hr_frcn_feat_path_list)
 
         # {question id} -> {question}
         self.qid_to_ques = self.ques_load(self.ques_list)
@@ -77,7 +87,19 @@ class DataSet(BaseDataSet):
         print('Finished!')
         print('')
 
+    def __getitem__(self, idx):
 
+        ques_ix_iter, ans_iter, iid = self.load_ques_ans(idx)
+
+        frcn_feat_iter, grid_feat_iter, bbox_feat_iter, scanpath_feat_iter = self.load_img_feats(idx, iid)
+
+        return \
+            torch.from_numpy(frcn_feat_iter),\
+            torch.from_numpy(grid_feat_iter),\
+            torch.from_numpy(bbox_feat_iter),\
+            torch.from_numpy(ques_ix_iter),\
+            torch.from_numpy(ans_iter),\
+            scanpath_feat_iter    
 
     def img_feat_path_load(self, path_list):
         iid_to_path = {}
@@ -115,18 +137,18 @@ class DataSet(BaseDataSet):
             pretrained_emb.append(spacy_tool('UNK').vector)
             pretrained_emb.append(spacy_tool('CLS').vector)
 
-        for ques in stat_ques_list:
-            words = re.sub(
-                r"([.,'!?\"()*#:;])",
-                '',
-                ques['question'].lower()
-            ).replace('-', ' ').replace('/', ' ').split()
+        # for ques in stat_ques_list:
+        #     words = re.sub(
+        #         r"([.,'!?\"()*#:;])",
+        #         '',
+        #         ques['question'].lower()
+        #     ).replace('-', ' ').replace('/', ' ').split()
 
-            for word in words:
-                if word not in token_to_ix:
-                    token_to_ix[word] = len(token_to_ix)
-                    if use_glove:
-                        pretrained_emb.append(spacy_tool(word).vector)
+        #     for word in words:
+        #         if word not in token_to_ix:
+        #             token_to_ix[word] = len(token_to_ix)
+        #             if use_glove:
+        #                 pretrained_emb.append(spacy_tool(word).vector)
 
         pretrained_emb = np.array(pretrained_emb)
 
@@ -192,6 +214,9 @@ class DataSet(BaseDataSet):
 
     def load_img_feats(self, idx, iid):
         frcn_feat = np.load(self.iid_to_frcn_feat_path[iid])
+        lr_frcn_feat = torch.load(self.lr_iid_to_frcn_feat_path[iid])
+        hr_frcn_feat = torch.load(self.hr_iid_to_frcn_feat_path[iid])
+
         frcn_feat_x = frcn_feat['x'].transpose((1, 0))
         frcn_feat_iter = self.proc_img_feat(frcn_feat_x, img_feat_pad_size=self.__C.FEAT_SIZE['vqa']['FRCN_FEAT_SIZE'][0])
 
@@ -203,8 +228,8 @@ class DataSet(BaseDataSet):
             img_feat_pad_size=self.__C.FEAT_SIZE['vqa']['BBOX_FEAT_SIZE'][0]
         )
         grid_feat_iter = np.zeros(1)
-
-        return frcn_feat_iter, grid_feat_iter, bbox_feat_iter
+        scanpath_feat_iter = self.init_scanpath_feat(hr_frcn_feat, lr_frcn_feat)
+        return frcn_feat_iter, grid_feat_iter, bbox_feat_iter, scanpath_feat_iter
 
 
 
@@ -295,3 +320,37 @@ class DataSet(BaseDataSet):
                     ans_score[ans_to_ix[ans_]] = self.get_score(ans_prob_dict[ans_])
 
         return ans_score
+
+    def init_scanpath_feat(self, hr, lr):
+        """ a reduced version of LHF_IRL(Dataset) __getitem__()"""
+        # update state with initial fixation
+        px, py = 0.5, 0.5
+        px, py = px * lr.size(-1), py * lr.size(-2)
+        mask = utils.foveal2mask(px, py, 2, hr.size(-2),
+                                 hr.size(-1))
+        mask = torch.from_numpy(mask)
+        mask = mask.unsqueeze(0).repeat(hr.size(0), 1, 1)
+        lr = (1 - mask) * lr + mask * hr
+
+        # history fixation map
+        history_map = torch.zeros((hr.size(-2), hr.size(-1)))
+        history_map = (1 - mask[0]) * history_map + mask[0] * 1
+
+        # action mask
+        action_mask = torch.zeros((10, 10),
+                                  dtype=torch.uint8)
+        px, py = 0.5, 0.5
+        px, py = int(px * 10), int(py * 10)
+        action_mask[py - 1:py + 1 + 1, px -
+                    1:px + 1 + 1] = 1
+        return {
+            'lr_feats': lr,
+            'hr_feats': hr,
+            'history_map': history_map,
+            'init_fix': torch.FloatTensor((0.5, 0.5)),
+            'action_mask': action_mask,
+            'img_name': torch.empty(1),
+            'cat_name': torch.empty(1),
+            'task_id': torch.empty(1),
+            'label_coding': torch.empty(1)
+        }

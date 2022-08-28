@@ -18,8 +18,11 @@ data/gqa/feats/gqa-frcn/
 data/gqa/feats/gqa-grid/
 data/vqa/raw/*.json
 data/vqa/feats/train2014/
+data/vqa/dcb/train2014/
 data/vqa/feats/val2014/
+data/vqa/dcb/val2014/
 data/vqa/feats/test2015/
+data/vqa/dcb/test2015/
 .idea/
 
 

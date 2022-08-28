@@ -2,15 +2,25 @@
 # OpenVQA
 # Written by Yuhao Cui https://github.com/cuiyuhao1996
 # --------------------------------------------------------
+import datetime
+import os
+import shutil
+import time
+from collections import OrderedDict
 
-import os, torch, datetime, shutil, time
 import numpy as np
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data as Data
+from irl_dcb.config import JsonConfig
+from irl_dcb.environment import IRL_Env4LHF
+from irl_dcb.utils import actions2scanpaths, collect_trajs
+from irl_dcb.models import MCAN_Policy, VQA_Module
 from openvqa.models.model_loader import ModelLoader
-from openvqa.utils.optim import get_optim, adjust_lr
-from utils.test_engine import test_engine, ckpt_proc
+from openvqa.utils.optim import adjust_lr, get_optim
+
+from utils.test_engine import ckpt_proc, test_engine
 
 
 def train_engine(__C, dataset, dataset_eval=None):
@@ -19,15 +29,40 @@ def train_engine(__C, dataset, dataset_eval=None):
     token_size = dataset.token_size
     ans_size = dataset.ans_size
     pretrained_emb = dataset.pretrained_emb
+    hparams = JsonConfig('/scratch/dimitrov/msc2022_stoyan/hparams/coco_search18.json')
+    load_path = '/scratch/dimitrov/msc2022_stoyan/assets/mcan_policy/checkpoints/trained_generator.pkg'
+    max_steps = hparams.Data.max_traj_length + 1
 
-    net = ModelLoader(__C).Net(
-        __C,
+    # set VQA net with load pretrained weights from the scanpath policy
+    net = VQA_Module(
+        hparams,
         pretrained_emb,
         token_size,
-        ans_size
+        ans_size,
+        device='cuda',
+        load_path=load_path
     )
+    # state = torch.load(load_path, map_location='cuda')
+    # state_dict = OrderedDict(('.'.join(k.split('.')[1:]), v) for (k, v) in state["model"].items() if k.startswith('actor_net'))
+    # net.proj = nn.Linear(__C.FLAT_OUT_SIZE, ans_size) # set the last layer new - for VQA, not for scanpath prediction
+
     net.cuda()
     net.train()
+
+    # set scanpath policy; load pretrained weigths    
+    policy = MCAN_Policy(hparams, pretrained_emb, token_size)
+    # policy.load_state_dict(state["model"])
+    policy.cuda()
+    policy.eval()
+
+    # init RL environment:
+    env = IRL_Env4LHF(hparams.Data,
+                        max_step=max_steps,
+                        mask_size=hparams.Data.IOR_size,
+                        status_update_mtd=hparams.Train.stop_criteria,
+                        device='cuda',
+                        img_only=False,
+                        inhibit_return=True)
 
     if __C.N_GPU > 1:
         net = nn.DataParallel(net, device_ids=__C.DEVICES)
@@ -139,7 +174,8 @@ def train_engine(__C, dataset, dataset_eval=None):
                 grid_feat_iter,
                 bbox_feat_iter,
                 ques_ix_iter,
-                ans_iter
+                ans_iter,
+                scanpath_feat_iter
         ) in enumerate(dataloader):
 
             optim.zero_grad()
@@ -170,10 +206,20 @@ def train_engine(__C, dataset, dataset_eval=None):
                     ans_iter[accu_step * __C.SUB_BATCH_SIZE:
                              (accu_step + 1) * __C.SUB_BATCH_SIZE]
 
+                # generate scanpaths with the environment 
+                scanpath_feat_iter["question_tokens"] = ques_ix_iter
+                env.set_data(scanpath_feat_iter)
+                with torch.no_grad():
+                    env.reset()
+                    trajs = collect_trajs(env,
+                                            policy,
+                                            hparams.Data.patch_num,
+                                            max_steps,
+                                            is_eval=True,
+                                            sample_action=True)
+                # use the last scanpath state
                 pred = net(
-                    sub_frcn_feat_iter,
-                    sub_grid_feat_iter,
-                    sub_bbox_feat_iter,
+                    trajs["obs"],
                     sub_ques_ix_iter
                 )
 
